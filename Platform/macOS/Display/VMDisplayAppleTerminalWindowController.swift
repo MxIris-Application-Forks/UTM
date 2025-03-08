@@ -21,7 +21,11 @@ class VMDisplayAppleTerminalWindowController: VMDisplayAppleWindowController, VM
     var terminalView: TerminalView! {
         mainView as? TerminalView
     }
-    
+
+    override var contentView: NSView? {
+        terminalView
+    }
+
     var serialConfig: UTMAppleConfigurationSerial! {
         appleConfig.serials[index]
     }
@@ -44,7 +48,7 @@ class VMDisplayAppleTerminalWindowController: VMDisplayAppleWindowController, VM
     private var isSizeChangeIgnored: Bool = true
     @Setting("OptionAsMetaKey") var isOptionAsMetaKey: Bool = false
     
-    convenience init(primaryForIndex index: Int, vm: UTMAppleVirtualMachine, onClose: ((Notification) -> Void)?) {
+    convenience init(primaryForIndex index: Int, vm: UTMAppleVirtualMachine, onClose: (() -> Void)?) {
         self.init(vm: vm, onClose: onClose)
         self.index = index
     }

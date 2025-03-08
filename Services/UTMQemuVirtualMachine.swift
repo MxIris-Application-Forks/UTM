@@ -16,13 +16,16 @@
 
 import Foundation
 import QEMUKit
+#if os(macOS)
+import SwiftPortmap
+#endif
 
 private var SpiceIoServiceGuestAgentContext = 0
 private let kSuspendSnapshotName = "suspend"
 private let kProbeSuspendDelay = 1*NSEC_PER_SEC
 
 /// QEMU backend virtual machine
-final class UTMQemuVirtualMachine: UTMVirtualMachine {
+final class UTMQemuVirtualMachine: UTMSpiceVirtualMachine {
     struct Capabilities: UTMVirtualMachineCapabilities {
         var supportsProcessKill: Bool {
             true
@@ -42,6 +45,10 @@ final class UTMQemuVirtualMachine: UTMVirtualMachine {
         
         var supportsRecoveryMode: Bool {
             false
+        }
+
+        var supportsRemoteSession: Bool {
+            true
         }
     }
     
@@ -88,7 +95,7 @@ final class UTMQemuVirtualMachine: UTMVirtualMachine {
         }
     }
     
-    private(set) var screenshot: PlatformImage? {
+    var screenshot: UTMVirtualMachineScreenshot? {
         willSet {
             onStateChange?()
         }
@@ -117,6 +124,9 @@ final class UTMQemuVirtualMachine: UTMVirtualMachine {
         }
     }
     
+    /// Pipe interface (alternative to UTMSpiceIO)
+    private var pipeInterface: UTMPipeInterface?
+
     private let qemuVM = QEMUVirtualMachine()
     
     private var system: UTMQemuSystem? {
@@ -144,7 +154,16 @@ final class UTMQemuVirtualMachine: UTMVirtualMachine {
     private var swtpm: UTMSWTPM?
     
     private var changeCursorRequestInProgress: Bool = false
-    
+
+    private static var resourceCacheOperationQueue = DispatchQueue(label: "Resource Cache Operation")
+    private static var isResourceCacheUpdated = false
+
+    #if WITH_SERVER
+    @Setting("ServerPort") private var serverPort: Int = 0
+    private var spicePort: SwiftPortmap.Port?
+    private(set) var spiceServerInfo: UTMRemoteMessageServer.StartVirtualMachine.ServerInformation?
+    #endif
+
     @MainActor required init(packageUrl: URL, configuration: UTMQemuConfiguration, isShortcut: Bool = false) throws {
         self.isScopedAccess = packageUrl.startAccessingSecurityScopedResource()
         // load configuration
@@ -259,6 +278,10 @@ extension UTMQemuVirtualMachine {
         guard await isSupported else {
             throw UTMQemuVirtualMachineError.emulationNotSupported
         }
+
+        // create QEMU resource cache if needed
+        try await ensureQemuResourceCacheUpToDate()
+
         let hasDebugLog = await config.qemu.hasDebugLog
         // start logging
         if hasDebugLog, let debugLogURL = await config.qemu.debugLogURL {
@@ -267,10 +290,24 @@ extension UTMQemuVirtualMachine {
             await qemuVM.setRedirectLog(url: nil)
         }
         let isRunningAsDisposible = options.contains(.bootDisposibleMode)
+        let isRemoteSession = options.contains(.remoteSession)
+        #if WITH_SERVER
+        let spicePassword = isRemoteSession ? String.random(length: 32) : nil
+        let spicePort = isRemoteSession ? try SwiftPortmap.Port.TCP(unusedPortStartingAt: UInt16(serverPort)) : nil
+        #else
+        if isRemoteSession {
+            throw UTMVirtualMachineError.notImplemented
+        }
+        #endif
         await MainActor.run {
             config.qemu.isDisposable = isRunningAsDisposible
+            #if WITH_SERVER
+            config.qemu.spiceServerPort = spicePort?.internalPort
+            config.qemu.spiceServerPassword = spicePassword
+            config.qemu.isSpiceServerTlsEnabled = true
+            #endif
         }
-        
+
         // start TPM
         if await config.qemu.hasTPMDevice {
             let swtpm = UTMSWTPM()
@@ -280,12 +317,12 @@ extension UTMQemuVirtualMachine {
             try await swtpm.start()
             self.swtpm = swtpm
         }
-        
+
         let allArguments = await config.allArguments
         let arguments = allArguments.map({ $0.string })
         let resources = allArguments.compactMap({ $0.fileUrls }).flatMap({ $0 })
         let remoteBookmarks = await remoteBookmarks
-        
+
         let system = await UTMQemuSystem(arguments: arguments, architecture: config.system.architecture.rawValue)
         system.resources = resources
         system.currentDirectoryUrl = await config.socketURL
@@ -295,12 +332,12 @@ extension UTMQemuVirtualMachine {
         system.hasDebugLog = hasDebugLog
         #endif
         try Task.checkCancellation()
-        
+
         if isShortcut {
             try await accessShortcut()
             try Task.checkCancellation()
         }
-        
+
         var options = UTMSpiceIOOptions()
         if await !config.sound.isEmpty {
             options.insert(.hasAudio)
@@ -317,14 +354,41 @@ extension UTMQemuVirtualMachine {
         }
         #endif
         let spiceSocketUrl = await config.spiceSocketURL
-        let ioService = UTMSpiceIO(socketUrl: spiceSocketUrl, options: options)
-        ioService.logHandler = { [weak system] (line: String) -> Void in
-            guard !line.contains("spice_make_scancode") else {
-                return // do not log key presses for privacy reasons
+        let interface: any QEMUInterface
+        let spicePublicKey: Data?
+        if isRemoteSession {
+            let pipeInterface = UTMPipeInterface()
+            await MainActor.run {
+                pipeInterface.monitorInPipeURL = config.monitorPipeURL.appendingPathExtension("in")
+                pipeInterface.monitorOutPipeURL = config.monitorPipeURL.appendingPathExtension("out")
+                pipeInterface.guestAgentInPipeURL = config.guestAgentPipeURL.appendingPathExtension("in")
+                pipeInterface.guestAgentOutPipeURL = config.guestAgentPipeURL.appendingPathExtension("out")
             }
-            system?.logging?.writeLine(line)
+            try pipeInterface.start()
+            interface = pipeInterface
+            // generate a TLS key for this session
+            guard let key = GenerateRSACertificate("UTM Remote SPICE Server" as CFString,
+                                                   "UTM" as CFString,
+                                                   Int.random(in: 1..<CLong.max) as CFNumber,
+                                                   1 as CFNumber,
+                                                   false as CFBoolean)?.takeUnretainedValue() as? [Data] else {
+                throw UTMQemuVirtualMachineError.keyGenerationFailed
+            }
+            try await key[1].write(to: config.spiceTlsKeyUrl)
+            try await key[2].write(to: config.spiceTlsCertUrl)
+            spicePublicKey = key[3]
+        } else {
+            let ioService = UTMSpiceIO(socketUrl: spiceSocketUrl, options: options)
+            ioService.logHandler = { [weak system] (line: String) -> Void in
+                guard !line.contains("spice_make_scancode") else {
+                    return // do not log key presses for privacy reasons
+                }
+                system?.logging?.writeLine(line)
+            }
+            try ioService.start()
+            interface = ioService
+            spicePublicKey = nil
         }
-        try ioService.start()
         try Task.checkCancellation()
         
         // create EFI variables for legacy config as well as handle UEFI resets
@@ -333,7 +397,7 @@ extension UTMQemuVirtualMachine {
         
         // start QEMU
         await qemuVM.setDelegate(self)
-        try await qemuVM.start(launcher: system, interface: ioService)
+        try await qemuVM.start(launcher: system, interface: interface)
         let monitor = await monitor!
         try Task.checkCancellation()
         
@@ -346,7 +410,11 @@ extension UTMQemuVirtualMachine {
         
         // set up SPICE sharing and removable drives
         try await self.restoreExternalDrives(withMounting: !isSuspended)
-        try await self.restoreSharedDirectory(for: ioService)
+        if let ioService = interface as? UTMSpiceIO {
+            try await self.restoreSharedDirectory(for: ioService)
+        } else {
+            // TODO: implement shared directory in remote interface
+        }
         try Task.checkCancellation()
         
         // continue VM boot
@@ -358,11 +426,29 @@ extension UTMQemuVirtualMachine {
         }
         
         // save ioService and let it set the delegate
-        self.ioService = ioService
+        self.ioService = interface as? UTMSpiceIO
+        self.pipeInterface = interface as? UTMPipeInterface
         self.isRunningAsDisposible = isRunningAsDisposible
         
         // test out snapshots
         self.snapshotUnsupportedError = await determineSnapshotSupport()
+
+        #if WITH_SERVER
+        // save server details
+        if let spicePort = spicePort, let spicePublicKey = spicePublicKey, let spicePassword = spicePassword {
+            self.spiceServerInfo = .init(spicePortInternal: spicePort.internalPort,
+                                         spicePortExternal: try? await spicePort.externalPort,
+                                         spiceHostExternal: try? await spicePort.externalIpv4Address,
+                                         spicePublicKey: spicePublicKey,
+                                         spicePassword: spicePassword)
+            self.spicePort = spicePort
+        }
+        #endif
+
+        // update timestamp
+        if !isRunningAsDisposible {
+            try? updateLastModified()
+        }
     }
     
     func start(options: UTMVirtualMachineStartOptions = []) async throws {
@@ -379,7 +465,7 @@ extension UTMQemuVirtualMachine {
             }
             try await startTask!.value
             state = .started
-            if screenshotTimer == nil {
+            if screenshotTimer == nil && !options.contains(.remoteSession) {
                 screenshotTimer = startScreenshotTimer()
             }
         } catch {
@@ -475,6 +561,7 @@ extension UTMQemuVirtualMachine {
         if result.localizedCaseInsensitiveContains("Error") {
             throw UTMQemuVirtualMachineError.qemuError(result)
         }
+        try? updateLastModified()
     }
     
     func saveSnapshot(name: String? = nil) async throws {
@@ -506,6 +593,7 @@ extension UTMQemuVirtualMachine {
             if result.localizedCaseInsensitiveContains("Error") {
                 throw UTMQemuVirtualMachineError.qemuError(result)
             }
+            try? updateLastModified()
         }
     }
     
@@ -584,10 +672,16 @@ extension UTMQemuVirtualMachine: QEMUVirtualMachineDelegate {
     }
     
     func qemuVMDidStop(_ qemuVM: QEMUVirtualMachine) {
+        #if WITH_SERVER
+        spicePort = nil
+        spiceServerInfo = nil
+        #endif
         swtpm?.stop()
         swtpm = nil
         ioService = nil
         ioServiceDelegate = nil
+        pipeInterface?.disconnect()
+        pipeInterface = nil
         snapshotUnsupportedError = nil
         try? saveScreenshot()
         state = .stopped
@@ -621,11 +715,27 @@ extension UTMQemuVirtualMachine: QEMUVirtualMachineDelegate {
 
 // MARK: - Input device switching
 extension UTMQemuVirtualMachine {
-    func requestInputTablet(_ tablet: Bool) {
-        guard !changeCursorRequestInProgress else {
+    func changeInputTablet(_ tablet: Bool) async throws {
+        defer {
+            changeCursorRequestInProgress = false
+        }
+        guard state == .started else {
             return
         }
-        guard let spiceIO = ioService else {
+        guard let monitor = await monitor else {
+            return
+        }
+        do {
+            let index = try await monitor.mouseIndex(forAbsolute: tablet)
+            try await monitor.mouseSelect(index)
+            ioService?.primaryInput?.requestMouseMode(!tablet)
+        } catch {
+            logger.error("Error changing mouse mode: \(error)")
+        }
+    }
+
+    func requestInputTablet(_ tablet: Bool) {
+        guard !changeCursorRequestInProgress else {
             return
         }
         changeCursorRequestInProgress = true
@@ -633,37 +743,8 @@ extension UTMQemuVirtualMachine {
             defer {
                 changeCursorRequestInProgress = false
             }
-            guard state == .started else {
-                return
-            }
-            guard let monitor = await monitor else {
-                return
-            }
-            do {
-                let index = try await monitor.mouseIndex(forAbsolute: tablet)
-                try await monitor.mouseSelect(index)
-                spiceIO.primaryInput?.requestMouseMode(!tablet)
-            } catch {
-                logger.error("Error changing mouse mode: \(error)")
-            }
+            try await changeInputTablet(tablet)
         }
-    }
-}
-
-// MARK: - USB redirection
-extension UTMQemuVirtualMachine {
-    var hasUsbRedirection: Bool {
-        return jb_has_usb_entitlement()
-    }
-}
-
-// MARK: - Screenshot
-extension UTMQemuVirtualMachine {
-    @MainActor @discardableResult
-    func takeScreenshot() async -> Bool {
-        let screenshot = await ioService?.screenshot()
-        self.screenshot = screenshot?.image
-        return true
     }
 }
 
@@ -695,7 +776,11 @@ extension UTMQemuVirtualMachine {
 
 // MARK: - External drives
 extension UTMQemuVirtualMachine {
-    func eject(_ drive: UTMQemuConfigurationDrive, isForced: Bool = false) async throws {
+    func eject(_ drive: UTMQemuConfigurationDrive) async throws {
+        try await eject(drive, isForced: false)
+    }
+
+    private func eject(_ drive: UTMQemuConfigurationDrive, isForced: Bool) async throws {
         guard drive.isExternal else {
             return
         }
@@ -707,20 +792,26 @@ extension UTMQemuVirtualMachine {
         }
         await registryEntry.removeExternalDrive(forId: drive.id)
     }
-    
-    func changeMedium(_ drive: UTMQemuConfigurationDrive, to url: URL, isAccessOnly: Bool = false) async throws {
-        _ = url.startAccessingSecurityScopedResource()
+
+    func changeMedium(_ drive: UTMQemuConfigurationDrive, to url: URL) async throws {
+        try await changeMedium(drive, to: url, isAccessOnly: false)
+    }
+
+    private func changeMedium(_ drive: UTMQemuConfigurationDrive, to url: URL, isAccessOnly: Bool) async throws {
+        let isScopedAccess = url.startAccessingSecurityScopedResource()
         defer {
-            url.stopAccessingSecurityScopedResource()
+            if isScopedAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
         }
         let tempBookmark = try url.bookmarkData()
         try await eject(drive, isForced: true)
         let file = try UTMRegistryEntry.File(url: url, isReadOnly: drive.isReadOnly)
         await registryEntry.setExternalDrive(file, forId: drive.id)
-        try await changeMedium(drive, with: tempBookmark, url: url, isSecurityScoped: false, isAccessOnly: isAccessOnly)
+        try await changeMedium(drive, with: tempBookmark, isSecurityScoped: false, isAccessOnly: isAccessOnly)
     }
-    
-    private func changeMedium(_ drive: UTMQemuConfigurationDrive, with bookmark: Data, url: URL?, isSecurityScoped: Bool, isAccessOnly: Bool) async throws {
+
+    private func changeMedium(_ drive: UTMQemuConfigurationDrive, with bookmark: Data, isSecurityScoped: Bool, isAccessOnly: Bool) async throws {
         let system = await system ?? UTMProcess()
         let (success, bookmark, path) = await system.accessData(withBookmark: bookmark, securityScoped: isSecurityScoped)
         guard let bookmark = bookmark, let path = path, success else {
@@ -728,11 +819,11 @@ extension UTMQemuVirtualMachine {
         }
         await registryEntry.updateExternalDriveRemoteBookmark(bookmark, forId: drive.id)
         if let qemu = await monitor, qemu.isConnected && !isAccessOnly {
-            try qemu.changeMedium(forDrive: "drive\(drive.id)", path: path)
+            try qemu.changeMedium(forDrive: "drive\(drive.id)", path: path, locking: false)
         }
     }
-    
-    func restoreExternalDrives(withMounting isMounting: Bool) async throws {
+
+    private func restoreExternalDrives(withMounting isMounting: Bool) async throws {
         guard await system != nil else {
             throw UTMQemuVirtualMachineError.invalidVmState
         }
@@ -743,7 +834,7 @@ extension UTMQemuVirtualMachine {
             let id = drive.id
             if let bookmark = await registryEntry.externalDrives[id]?.remoteBookmark {
                 // an image bookmark was saved while QEMU was running
-                try await changeMedium(drive, with: bookmark, url: nil, isSecurityScoped: true, isAccessOnly: !isMounting)
+                try await changeMedium(drive, with: bookmark, isSecurityScoped: true, isAccessOnly: !isMounting)
             } else if let localBookmark = await registryEntry.externalDrives[id]?.bookmark {
                 // an image bookmark was saved while QEMU was NOT running
                 let url = try URL(resolvingPersistentBookmarkData: localBookmark)
@@ -754,43 +845,14 @@ extension UTMQemuVirtualMachine {
             }
         }
     }
-    
-    @MainActor func externalImageURL(for drive: UTMQemuConfigurationDrive) -> URL? {
-        registryEntry.externalDrives[drive.id]?.url
-    }
 }
 
 // MARK: - Shared directory
 extension UTMQemuVirtualMachine {
-    @MainActor var sharedDirectoryURL: URL? {
-        registryEntry.sharedDirectories.first?.url
+    func stopAccessingPath(_ path: String) async {
+        await system?.stopAccessingPath(path)
     }
-    
-    func clearSharedDirectory() async {
-        if let oldPath = await registryEntry.sharedDirectories.first?.path {
-            await system?.stopAccessingPath(oldPath)
-        }
-        await registryEntry.removeAllSharedDirectories()
-    }
-    
-    func changeSharedDirectory(to url: URL) async throws {
-        await clearSharedDirectory()
-        _ = url.startAccessingSecurityScopedResource()
-        defer {
-            url.stopAccessingSecurityScopedResource()
-        }
-        let file = try await UTMRegistryEntry.File(url: url, isReadOnly: config.sharing.isDirectoryShareReadOnly)
-        await registryEntry.setSingleSharedDirectory(file)
-        if await config.sharing.directoryShareMode == .webdav {
-            if let ioService = ioService {
-                ioService.changeSharedDirectory(url)
-            }
-        } else if await config.sharing.directoryShareMode == .virtfs {
-            let tempBookmark = try url.bookmarkData()
-            try await changeVirtfsSharedDirectory(with: tempBookmark, isSecurityScoped: false)
-        }
-    }
-    
+
     func changeVirtfsSharedDirectory(with bookmark: Data, isSecurityScoped: Bool) async throws {
         let system = await system ?? UTMProcess()
         let (success, bookmark, path) = await system.accessData(withBookmark: bookmark, securityScoped: isSecurityScoped)
@@ -799,61 +861,10 @@ extension UTMQemuVirtualMachine {
         }
         await registryEntry.updateSingleSharedDirectoryRemoteBookmark(bookmark)
     }
-    
-    func restoreSharedDirectory(for ioService: UTMSpiceIO) async throws {
-        guard let share = await registryEntry.sharedDirectories.first else {
-            return
-        }
-        if await config.sharing.directoryShareMode == .virtfs {
-            if let bookmark = share.remoteBookmark {
-                // a share bookmark was saved while QEMU was running
-                try await changeVirtfsSharedDirectory(with: bookmark, isSecurityScoped: true)
-            } else {
-                // a share bookmark was saved while QEMU was NOT running
-                let url = try URL(resolvingPersistentBookmarkData: share.bookmark)
-                try await changeSharedDirectory(to: url)
-            }
-        } else if await config.sharing.directoryShareMode == .webdav {
-            ioService.changeSharedDirectory(share.url)
-        }
-    }
 }
 
 // MARK: - Registry syncing
 extension UTMQemuVirtualMachine {
-    @MainActor func updateRegistryFromConfig() async throws {
-        // save a copy to not collide with updateConfigFromRegistry()
-        let configShare = config.sharing.directoryShareUrl
-        let configDrives = config.drives
-        try await updateRegistryBasics()
-        for drive in configDrives {
-            if drive.isExternal, let url = drive.imageURL {
-                try await changeMedium(drive, to: url)
-            } else if drive.isExternal {
-                try await eject(drive)
-            }
-        }
-        if let url = configShare {
-            try await changeSharedDirectory(to: url)
-        } else {
-            await clearSharedDirectory()
-        }
-        // remove any unreferenced drives
-        registryEntry.externalDrives = registryEntry.externalDrives.filter({ element in
-            configDrives.contains(where: { $0.id == element.key && $0.isExternal })
-        })
-    }
-    
-    @MainActor func updateConfigFromRegistry() {
-        config.sharing.directoryShareUrl = sharedDirectoryURL
-        for i in config.drives.indices {
-            let id = config.drives[i].id
-            if config.drives[i].isExternal {
-                config.drives[i].imageURL = registryEntry.externalDrives[id]?.url
-            }
-        }
-    }
-    
     @MainActor func changeUuid(to uuid: UUID, name: String? = nil, copyingEntry entry: UTMRegistryEntry? = nil) {
         config.information.uuid = uuid
         if let name = name {
@@ -864,7 +875,7 @@ extension UTMQemuVirtualMachine {
             registryEntry.update(copying: entry)
         }
     }
-    
+
     @MainActor var remoteBookmarks: [URL: Data] {
         var dict = [URL: Data]()
         for file in registryEntry.externalDrives.values {
@@ -881,6 +892,93 @@ extension UTMQemuVirtualMachine {
     }
 }
 
+// MARK: - Caching QEMU resources
+extension UTMQemuVirtualMachine {
+    private func _ensureQemuResourceCacheUpToDate() throws {
+        let fm = FileManager.default
+        let qemuResourceUrl = Bundle.main.url(forResource: "qemu", withExtension: nil)!
+        let cacheUrl = try fm.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let qemuCacheUrl = cacheUrl.appendingPathComponent("qemu", isDirectory: true)
+
+        guard fm.fileExists(atPath: qemuCacheUrl.path) else {
+            try fm.copyItem(at: qemuResourceUrl, to: qemuCacheUrl)
+            return
+        }
+
+        logger.info("Updating QEMU resource cache...")
+        // first visit all the subdirectories and create them if needed
+        let subdirectoryEnumerator = fm.enumerator(at: qemuResourceUrl, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .producesRelativePathURLs, .includesDirectoriesPostOrder])!
+        for case let directoryURL as URL in subdirectoryEnumerator {
+            guard subdirectoryEnumerator.isEnumeratingDirectoryPostOrder else {
+                continue
+            }
+            let relativePath = directoryURL.relativePath
+            let destUrl = qemuCacheUrl.appendingPathComponent(relativePath)
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: destUrl.path, isDirectory: &isDirectory) {
+                // old file is now a directory
+                if !isDirectory.boolValue {
+                    logger.info("Removing file \(destUrl.path)")
+                    try fm.removeItem(at: destUrl)
+                } else {
+                    continue
+                }
+            }
+            logger.info("Creating directory \(destUrl.path)")
+            try fm.createDirectory(at: destUrl, withIntermediateDirectories: true)
+        }
+        // next check all the files
+        let fileEnumerator = fm.enumerator(at: qemuResourceUrl, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey], options: [.skipsHiddenFiles, .producesRelativePathURLs])!
+        for case let sourceUrl as URL in fileEnumerator {
+            let relativePath = sourceUrl.relativePath
+            let sourceResourceValues = try sourceUrl.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey])
+            guard !sourceResourceValues.isDirectory! else {
+                continue
+            }
+            let destUrl = qemuCacheUrl.appendingPathComponent(relativePath)
+            if fm.fileExists(atPath: destUrl.path) {
+                // first do a quick comparsion with resource keys
+                let destResourceValues = try destUrl.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey])
+                // old directory is now a file
+                if destResourceValues.isDirectory! {
+                    logger.info("Removing directory \(destUrl.path)")
+                    try fm.removeItem(at: destUrl)
+                } else if destResourceValues.contentModificationDate == sourceResourceValues.contentModificationDate && destResourceValues.fileSize == sourceResourceValues.fileSize {
+                    // assume the file is the same
+                    continue
+                } else {
+                    logger.info("Removing file \(destUrl.path)")
+                    try fm.removeItem(at: destUrl)
+                }
+            }
+            // if we are here, the file has changed
+            logger.info("Copying file \(sourceUrl.path) to \(destUrl.path)")
+            try fm.copyItem(at: sourceUrl, to: destUrl)
+        }
+    }
+
+    func ensureQemuResourceCacheUpToDate() async throws {
+        guard !Self.isResourceCacheUpdated else {
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            Self.resourceCacheOperationQueue.async { [weak self] in
+                do {
+                    if !Self.isResourceCacheUpdated {
+                        try self?._ensureQemuResourceCacheUpToDate()
+                        Self.isResourceCacheUpdated = true
+                    }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Errors
+
 enum UTMQemuVirtualMachineError: Error {
     case failedToAccessShortcut
     case emulationNotSupported
@@ -889,6 +987,7 @@ enum UTMQemuVirtualMachineError: Error {
     case accessShareFailed
     case invalidVmState
     case saveSnapshotFailed(Error)
+    case keyGenerationFailed
 }
 
 extension UTMQemuVirtualMachineError: LocalizedError {
@@ -905,6 +1004,8 @@ extension UTMQemuVirtualMachineError: LocalizedError {
         case .invalidVmState: return NSLocalizedString("The virtual machine is in an invalid state.", comment: "UTMQemuVirtualMachine")
         case .saveSnapshotFailed(let error):
             return String.localizedStringWithFormat(NSLocalizedString("Failed to save VM snapshot. Usually this means at least one device does not support snapshots. %@", comment: "UTMQemuVirtualMachine"), error.localizedDescription)
+        case .keyGenerationFailed:
+            return NSLocalizedString("Failed to generate TLS key for server.", comment: "UTMQemuVirtualMachine")
         }
     }
 }

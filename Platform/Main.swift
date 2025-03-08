@@ -15,6 +15,7 @@
 //
 
 import Logging
+import TipKit
 
 let logger = Logger(label: "com.utmapp.UTM") { label in
     var utmLogger = UTMLoggingSwift(label: label)
@@ -34,7 +35,7 @@ class Main {
     static var jitAvailable = true
     
     static func main() {
-        #if (os(iOS) || os(visionOS)) && !WITH_QEMU_TCI
+        #if (os(iOS) || os(visionOS)) && WITH_JIT
         // check if we have jailbreak
         if jb_spawn_ptrace_child(CommandLine.argc, CommandLine.unsafeArgv) {
             logger.info("JIT: ptrace() child spawn trick")
@@ -60,6 +61,10 @@ class Main {
         #if os(iOS) || os(visionOS)
         // register defaults
         registerDefaultsFromSettingsBundle()
+        // register tips
+        if #available(iOS 17, macOS 14, *) {
+            try? Tips.configure()
+        }
         #endif
         UTMApp.main()
     }

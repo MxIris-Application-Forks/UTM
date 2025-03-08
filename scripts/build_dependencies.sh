@@ -66,9 +66,11 @@ check_env () {
     command -v python3 >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'python3' on your host machine.${NC}"; exit 1; }
     python_module_test six >/dev/null 2>&1 || { echo >&2 "${RED}'six' not found in your Python 3 installation.${NC}"; exit 1; }
     python_module_test pyparsing >/dev/null 2>&1 || { echo >&2 "${RED}'pyparsing' not found in your Python 3 installation.${NC}"; exit 1; }
+    python_module_test distutils >/dev/null 2>&1 || { echo >&2 "${RED}'distutils' not found in your Python 3 installation.${NC}"; exit 1; }
     command -v meson >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'meson' on your host machine.${NC}"; exit 1; }
     command -v msgfmt >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'gettext' on your host machine.\n\t'msgfmt' needs to be in your \$PATH as well.${NC}"; exit 1; }
     command -v glib-mkenums >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'glib-utils' on your host machine.\n\t'glib-mkenums' needs to be in your \$PATH as well.${NC}"; exit 1; }
+    command -v glib-compile-resources >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'glib-utils' on your host machine.\n\t'glib-compile-resources' needs to be in your \$PATH as well.${NC}"; exit 1; }
     command -v gpg-error-config >/dev/null 2>&1 || { echo >&2 "${RED}You must install 'libgpg-error' on your host machine.\n\t'gpg-error-config' needs to be in your \$PATH as well.${NC}"; exit 1; }
     command -v xcrun >/dev/null 2>&1 || { echo >&2 "${RED}'xcrun' is not found. Make sure you are running on OSX."; exit 1; }
     command -v otool >/dev/null 2>&1 || { echo >&2 "${RED}'otool' is not found. Make sure you are running on OSX."; exit 1; }
@@ -117,7 +119,7 @@ clone () {
         echo "${GREEN}$DIR already downloaded! Run with -d to force re-download.${NC}"
     else
         rm -rf "$DIR"
-        echo "${GREEN}Cloning ${URL}...${NC}"
+        echo "${GREEN}Cloning ${REPO}...${NC}"
         git clone --filter=tree:0 --no-checkout "$REPO" "$DIR"
         if [ ! -z "$SUBDIRS" ]; then
             git -C "$DIR" sparse-checkout init
@@ -164,6 +166,7 @@ download_all () {
     clone $EPOXY_REPO $EPOXY_COMMIT
     clone $VIRGLRENDERER_REPO $VIRGLRENDERER_COMMIT
     clone $HYPERVISOR_REPO $HYPERVISOR_COMMIT
+    clone $LIBUCONTEXT_REPO $LIBUCONTEXT_COMMIT
 }
 
 copy_private_headers() {
@@ -205,8 +208,10 @@ generate_meson_cross() {
     echo "[built-in options]" >> $cross
     echo "c_args = [${CFLAGS:+$(meson_quote $CFLAGS)}]" >> $cross
     echo "cpp_args = [${CXXFLAGS:+$(meson_quote $CXXFLAGS)}]" >> $cross
+    echo "objc_args = [${CFLAGS:+$(meson_quote $CFLAGS)}]" >> $cross
     echo "c_link_args = [${LDFLAGS:+$(meson_quote $LDFLAGS)}]" >> $cross
     echo "cpp_link_args = [${LDFLAGS:+$(meson_quote $LDFLAGS)}]" >> $cross
+    echo "objc_link_args = [${LDFLAGS:+$(meson_quote $LDFLAGS)}]" >> $cross
     echo "[binaries]" >> $cross
     echo "c = [$(meson_quote $CC)]" >> $cross
     echo "cpp = [$(meson_quote $CXX)]" >> $cross
@@ -217,6 +222,8 @@ generate_meson_cross() {
     echo "ranlib = [$(meson_quote $RANLIB)]" >> $cross
     echo "strip = [$(meson_quote $STRIP), '-x']" >> $cross
     echo "python = ['$(which python3)']" >> $cross
+    echo "glib-mkenums = ['$(which glib-mkenums)']" >> $cross
+    echo "glib-compile-resources = ['$(which glib-compile-resources)']" >> $cross
     echo "[host_machine]" >> $cross
     case $PLATFORM in
     ios* | visionos* )
@@ -257,7 +264,7 @@ build_pkg_config() {
     cd "$DIR"
     if [ -z "$REBUILD" ]; then
         echo "${GREEN}Configuring ${NAME}...${NC}"
-        env -i ./configure --prefix="$PREFIX" --bindir="$PREFIX/host/bin" --with-internal-glib $@
+        env -i CFLAGS="-Wno-error=int-conversion" ./configure --prefix="$PREFIX" --bindir="$PREFIX/host/bin" --with-internal-glib $@
     fi
     echo "${GREEN}Building ${NAME}...${NC}"
     make -j$NCPU
@@ -408,7 +415,21 @@ build_angle () {
     export PATH="$(realpath "$BUILD_DIR/depot_tools.git"):$OLD_PATH"
     pwd="$(pwd)"
     cd "$BUILD_DIR/WebKit.git/Source/ThirdParty/ANGLE"
-    xcodebuild archive -archivePath "ANGLE" -scheme "ANGLE" -sdk $SDK -arch $ARCH -configuration Release WEBCORE_LIBRARY_DIR="/usr/local/lib" IPHONEOS_DEPLOYMENT_TARGET="14.0" MACOSX_DEPLOYMENT_TARGET="11.0" XROS_DEPLOYMENT_TARGET="1.0"
+    env -i PATH=$PATH xcodebuild archive -archivePath "ANGLE" \
+                                         -scheme "ANGLE" \
+                                         -sdk $SDK \
+                                         -arch $ARCH \
+                                         -configuration Release \
+                                         WEBCORE_LIBRARY_DIR="/usr/local/lib" \
+                                         NORMAL_UMBRELLA_FRAMEWORKS_DIR="" \
+                                         CODE_SIGNING_ALLOWED=NO \
+                                         IPHONEOS_DEPLOYMENT_TARGET="14.0" \
+                                         MACOSX_DEPLOYMENT_TARGET="11.0" \
+                                         XROS_DEPLOYMENT_TARGET="1.0"
+    # FIXME: update minver and remove this hack
+    if [ "$SDK" == "iphoneos" ]; then
+        find "ANGLE.xcarchive/Products/usr/local/lib/" -name '*.dylib' -exec xcrun vtool -set-version-min ios $SDKMINVER 17.2 -replace -output \{\} \{\} \;
+    fi
     rsync -a "ANGLE.xcarchive/Products/usr/local/lib/" "$PREFIX/lib"
     rsync -a "include/" "$PREFIX/include"
     cd "$pwd"
@@ -445,7 +466,7 @@ build_qemu_dependencies () {
     build $GETTEXT_SRC --disable-java
     build $PNG_SRC
     build $JPEG_TURBO_SRC
-    meson_build $GLIB_SRC -Dtests=false
+    meson_build $GLIB_SRC -Dtests=false -Ddtrace=disabled
     build $GPG_ERROR_SRC
     build $GCRYPT_SRC
     build $PIXMAN_SRC
@@ -477,12 +498,12 @@ build_qemu_dependencies () {
 }
 
 build_spice_client () {
-    meson_build "$QEMU_DIR/subprojects/libucontext" -Ddefault_library=static -Dfreestanding=true
+    meson_build $LIBUCONTEXT_REPO -Ddefault_library=static -Dfreestanding=true
     meson_build $JSON_GLIB_SRC -Dintrospection=disabled
     build $XML2_SRC --enable-shared=no --without-python
-    meson_build $SOUP_SRC --default-library static -Dsysprof=disabled -Dtls_check=false -Dintrospection=disabled
+    meson_build $SOUP_SRC -Dsysprof=disabled -Dtls_check=false -Dintrospection=disabled
     meson_build $PHODAV_SRC
-    meson_build $SPICE_CLIENT_SRC -Dcoroutine=libucontext -Dphysical-cd=disabled
+    meson_build $SPICE_CLIENT_SRC -Dcoroutine=libucontext
 }
 
 fixup () {
@@ -631,25 +652,26 @@ ios* | visionos* )
     case $PLATFORM in
     ios_simulator* )
         SDK=iphonesimulator
-        CFLAGS_MINVER="-mios-simulator-version-min=$SDKMINVER"
+        CFLAGS_TARGET="-target $ARCH-apple-ios$SDKMINVER-simulator"
         PLATFORM_FAMILY_PREFIX="iOS_Simulator"
         ;;
     ios* )
         SDK=iphoneos
-        CFLAGS_MINVER="-miphoneos-version-min=$SDKMINVER"
+        CFLAGS_TARGET="-target $ARCH-apple-ios$SDKMINVER"
         PLATFORM_FAMILY_PREFIX="iOS"
         HVF_FLAGS="--enable-hvf-private"
         ;;
     visionos_simulator* )
         SDK=xrsimulator
+        CFLAGS_TARGET="-target $ARCH-apple-xros$SDKMINVER-simulator"
         PLATFORM_FAMILY_PREFIX="visionOS_Simulator"
         ;;
     visionos* )
         SDK=xros
+        CFLAGS_TARGET="-target $ARCH-apple-xros$SDKMINVER"
         PLATFORM_FAMILY_PREFIX="visionOS"
         ;;
     esac
-    CFLAGS_TARGET=
     case $PLATFORM in
     *-tci )
         if [ "$ARCH" == "arm64" ]; then
@@ -671,8 +693,7 @@ macos )
         SDKMINVER="$MAC_SDKMINVER"
     fi
     SDK=macosx
-    CFLAGS_MINVER="-mmacos-version-min=$SDKMINVER"
-    CFLAGS_TARGET="-target $ARCH-apple-macos"
+    CFLAGS_TARGET="-target $ARCH-apple-macos$SDKMINVER"
     PLATFORM_FAMILY_NAME="macOS"
     QEMU_PLATFORM_BUILD_FLAGS="--disable-debug-info --enable-shared-lib --disable-cocoa --cpu=$CPU"
     ;;
@@ -725,7 +746,7 @@ fi
 export NCPU
 
 # Export tools
-CC=$(xcrun --sdk $SDK --find gcc)
+CC="$(xcrun --sdk $SDK --find gcc) $CFLAGS_TARGET"
 CPP=$(xcrun --sdk $SDK --find gcc)" -E"
 CXX=$(xcrun --sdk $SDK --find g++)
 OBJCC=$(xcrun --sdk $SDK --find clang)
@@ -746,11 +767,11 @@ export STRIP
 export PREFIX
 
 # Flags
-CFLAGS="$CFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_MINVER $CFLAGS_TARGET"
-CPPFLAGS="$CPPFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_MINVER $CFLAGS_TARGET"
-CXXFLAGS="$CXXFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_MINVER $CFLAGS_TARGET"
-OBJCFLAGS="$OBJCFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_MINVER $CFLAGS_TARGET"
-LDFLAGS="$LDFLAGS -arch $ARCH -isysroot $SDKROOT -L$PREFIX/lib -F$PREFIX/Frameworks $CFLAGS_MINVER $CFLAGS_TARGET"
+CFLAGS="$CFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks"
+CPPFLAGS="$CPPFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_TARGET"
+CXXFLAGS="$CXXFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_TARGET"
+OBJCFLAGS="$OBJCFLAGS -arch $ARCH -isysroot $SDKROOT -I$PREFIX/include -F$PREFIX/Frameworks $CFLAGS_TARGET"
+LDFLAGS="$LDFLAGS -arch $ARCH -isysroot $SDKROOT -L$PREFIX/lib -F$PREFIX/Frameworks $CFLAGS_TARGET"
 export CFLAGS
 export CPPFLAGS
 export CXXFLAGS
@@ -774,6 +795,7 @@ echo "${GREEN}Deleting old sysroot!${NC}"
 rm -rf "$PREFIX/"*
 rm -f "$BUILD_DIR/BUILD_SUCCESS"
 rm -f "$BUILD_DIR/meson.cross"
+mkdir -p "$PREFIX/Frameworks"
 copy_private_headers
 build_pkg_config
 build_qemu_dependencies

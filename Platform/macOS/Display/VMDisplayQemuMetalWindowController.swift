@@ -43,7 +43,8 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
     private var localEventMonitor: Any? = nil
     private var globalEventMonitor: Any? = nil
     private var ctrlKeyDown: Bool = false
-    
+    private var screenChangedToken: Any?
+
     private var displayConfig: UTMQemuConfigurationDisplay? {
         vmQemuConfig?.displays[id]
     }
@@ -60,15 +61,14 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
     
     @Setting("NoCursorCaptureAlert") private var isCursorCaptureAlertShown: Bool = false
     @Setting("NoFullscreenCursorCaptureAlert") private var isFullscreenCursorCaptureAlertShown: Bool = false
-    @Setting("DisplayFixed") private var isDisplayFixed: Bool = false
     @Setting("FullScreenAutoCapture") private var isFullScreenAutoCapture: Bool = false
+    @Setting("WindowFocusAutoCapture") private var isWindowFocusAutoCapture: Bool = false
     @Setting("CtrlRightClick") private var isCtrlRightClick: Bool = false
     @Setting("AlternativeCaptureKey") private var isAlternativeCaptureKey: Bool = false
     @Setting("IsCapsLockKey") private var isCapsLockKey: Bool = false
     @Setting("IsNumLockForced") private var isNumLockForced: Bool = false
     @Setting("InvertScroll") private var isInvertScroll: Bool = false
     @Setting("QEMURendererFPSLimit") private var rendererFpsLimit: Int = 0
-    private var settingObservations = [NSKeyValueObservation]()
     
     // MARK: - Init
     
@@ -102,18 +102,31 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
         vmDisplay?.addRenderer(renderer) // can be nil if primary
         metalView.delegate = renderer
         metalView.inputDelegate = self
-        
-        settingObservations.append(UserDefaults.standard.observe(\.DisplayFixed, options: .new) { (defaults, change) in
-            self.displaySizeDidChange(size: self.displaySize)
-        })
-        
+
+        screenChangedToken = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: nil, queue: .main) { [weak self] _ in
+            // update minSize when we change screens
+            if let self = self,
+               let window = window,
+               displaySize != .zero,
+               !isDisplaySizeDynamic {
+                window.contentMinSize = contentMinSize(in: window, for: displaySize)
+            }
+        }
+
+        if isSecondary && isDisplaySizeDynamic, let window = window {
+            restoreDynamicResolution(for: window)
+        }
+
         super.windowDidLoad()
     }
     
     override func windowWillClose(_ notification: Notification) {
         vmDisplay?.removeRenderer(renderer!)
         stopAllCapture()
-        settingObservations = []
+        if let screenChangedToken = screenChangedToken {
+            NotificationCenter.default.removeObserver(screenChangedToken)
+        }
+        screenChangedToken = nil
         super.windowWillClose(notification)
     }
     
@@ -144,12 +157,15 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
         }
         super.enterLive()
         resizeConsoleToolbarItem.isEnabled = false // disable item
+        if isWindowFocusAutoCapture {
+            captureMouse()
+        }
     }
     
     override func enterSuspended(isBusy busy: Bool) {
         if !busy {
             metalView.isHidden = true
-            screenshotView.image = vm.screenshot
+            screenshotView.image = vm.screenshot?.image
             screenshotView.isHidden = false
         }
         if vm.state == .stopped {
@@ -236,10 +252,10 @@ extension VMDisplayQemuMetalWindowController {
             return
         }
         if isDisplaySizeDynamic != supported {
-            displaySizeDidChange(size: displaySize)
+            displaySizeDidChange(size: displaySize, shouldSaveResolution: false)
             DispatchQueue.main.async {
                 if supported, let window = self.window {
-                    _ = self.updateGuestResolution(for: window, frameSize: window.frame.size)
+                    self.restoreDynamicResolution(for: window)
                 }
             }
         }
@@ -250,7 +266,7 @@ extension VMDisplayQemuMetalWindowController {
     
 // MARK: - Screen management
 extension VMDisplayQemuMetalWindowController {
-    fileprivate func displaySizeDidChange(size: CGSize) {
+    fileprivate func displaySizeDidChange(size: CGSize, shouldSaveResolution: Bool = true) {
         // cancel any pending resize
         cancelResize?.cancel()
         cancelResize = nil
@@ -270,6 +286,9 @@ extension VMDisplayQemuMetalWindowController {
             } else {
                 self.updateHostFrame(forGuestResolution: size)
             }
+            if shouldSaveResolution {
+                self.saveDynamicResolution()
+            }
         }
     }
     
@@ -279,17 +298,31 @@ extension VMDisplayQemuMetalWindowController {
             displaySizeDidChange(size: vmDisplay.displaySize)
         }
     }
-    
+
+    private func contentMinSize(in window: NSWindow, for displaySize: CGSize) -> CGSize {
+        let currentScreenScale = window.screen?.backingScaleFactor ?? 1.0
+        let nativeScale = displayConfig!.isNativeResolution ? 1.0 : currentScreenScale
+        let minScaledSize = CGSize(width: displaySize.width * nativeScale / currentScreenScale, height: displaySize.height * nativeScale / currentScreenScale)
+        guard let screenSize = window.screen?.visibleFrame.size else {
+            return minScaledSize
+        }
+        let excessSize = window.frameRect(forContentRect: .zero).size
+        // if the window is larger than our host screen, shrink the min size allowed
+        let widthScale = (screenSize.width - excessSize.width) / displaySize.width
+        let heightScale = (screenSize.height - excessSize.height) / displaySize.height
+        let scale = min(min(widthScale, heightScale), 1.0)
+        return CGSize(width: displaySize.width * scale, height: displaySize.height * scale)
+    }
+
     fileprivate func updateHostFrame(forGuestResolution size: CGSize) {
         guard let window = window else { return }
         guard let vmDisplay = vmDisplay else { return }
         let currentScreenScale = window.screen?.backingScaleFactor ?? 1.0
         let nativeScale = displayConfig!.isNativeResolution ? 1.0 : currentScreenScale
         // change optional scale if needed
-        if isDisplaySizeDynamic || isDisplayFixed || (!displayConfig!.isNativeResolution && vmDisplay.viewportScale < currentScreenScale) {
+        if isDisplaySizeDynamic || (!displayConfig!.isNativeResolution && vmDisplay.viewportScale < currentScreenScale) {
             vmDisplay.viewportScale = nativeScale
         }
-        let minScaledSize = CGSize(width: size.width * nativeScale / currentScreenScale, height: size.height * nativeScale / currentScreenScale)
         let fullContentWidth = size.width * vmDisplay.viewportScale / currentScreenScale
         let fullContentHeight = size.height * vmDisplay.viewportScale / currentScreenScale
         let contentRect = CGRect(x: window.frame.origin.x,
@@ -303,7 +336,7 @@ extension VMDisplayQemuMetalWindowController {
             window.contentResizeIncrements = NSSize(width: 1, height: 1)
             window.setFrame(windowRect, display: false, animate: false)
         } else {
-            window.contentMinSize = minScaledSize
+            window.contentMinSize = contentMinSize(in: window, for: size)
             window.contentAspectRatio = size
             window.setFrame(windowRect, display: false, animate: true)
         }
@@ -338,9 +371,6 @@ extension VMDisplayQemuMetalWindowController {
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
         guard !self.isDisplaySizeDynamic else {
-            return frameSize
-        }
-        guard !self.isDisplayFixed else {
             return frameSize
         }
         let newSize = updateHostScaling(for: sender, frameSize: frameSize)
@@ -387,7 +417,6 @@ extension VMDisplayQemuMetalWindowController {
     func windowDidEnterFullScreen(_ notification: Notification) {
         isFullScreen = true
         if isFullScreenAutoCapture {
-            captureMouseToolbarButton.state = .on
             captureMouse()
         }
     }
@@ -395,14 +424,61 @@ extension VMDisplayQemuMetalWindowController {
     func windowDidExitFullScreen(_ notification: Notification) {
         isFullScreen = false
         if isFullScreenAutoCapture {
-            captureMouseToolbarButton.state = .off
             releaseMouse()
         }
+    }
+    
+    func windowDidBecomeMain(_ notification: Notification) {
+        // Do not capture mouse if user did not clicked inside the metalView because the window will be draged if user hold the mouse button.
+        guard let window = window,
+              window.mouseLocationOutsideOfEventStream.y < metalView.frame.height,
+              captureMouseToolbarButton.state == .off,
+              isWindowFocusAutoCapture else {
+            return
+        }
+        captureMouse()
+    }
+    
+    func windowDidResignMain(_ notification: Notification) {
+        releaseMouse()
+    }
+    
+    override func windowDidBecomeKey(_ notification: Notification) {
+        if isFullScreen && isFullScreenAutoCapture {
+            captureMouse()
+        }
+        super.windowDidBecomeKey(notification)
     }
     
     override func windowDidResignKey(_ notification: Notification) {
         releaseMouse()
         super.windowDidResignKey(notification)
+    }
+}
+
+// MARK: - Save and restore resolution
+@MainActor extension VMDisplayQemuMetalWindowController {
+    func saveDynamicResolution() {
+        guard isDisplaySizeDynamic else {
+            return
+        }
+        var resolution = UTMRegistryEntry.Resolution()
+        resolution.isFullscreen = isFullScreen
+        resolution.size = displaySize
+        vm.registryEntry.resolutionSettings[id] = resolution
+    }
+
+    func restoreDynamicResolution(for window: NSWindow) {
+        guard let resolution = vm.registryEntry.resolutionSettings[id] else {
+            return
+        }
+        if resolution.isFullscreen && !isFullScreen {
+            window.toggleFullScreen(self)
+        } else if let vmDisplay = vmDisplay, resolution.size != .zero {
+            vmDisplay.requestResolution(CGRect(origin: .zero, size: resolution.size))
+        } else {
+            _ = self.updateGuestResolution(for: window, frameSize: window.frame.size)
+        }
     }
 }
 

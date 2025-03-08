@@ -19,9 +19,13 @@ import UniformTypeIdentifiers
 #if os(iOS)
 import IQKeyboardManagerSwift
 #endif
+import TipKit
 
-#if WITH_QEMU_TCI
+// on visionOS, there is no text to show more than UTM
+#if WITH_QEMU_TCI && !os(visionOS)
 let productName = "UTM SE"
+#elseif WITH_REMOTE && !os(visionOS)
+let productName = "UTM Remote"
 #else
 let productName = "UTM"
 #endif
@@ -30,10 +34,10 @@ struct ContentView: View {
     @State private var editMode = false
     @EnvironmentObject private var data: UTMData
     @StateObject private var releaseHelper = UTMReleaseHelper()
-    @State private var newPopupPresented = false
     @State private var openSheetPresented = false
     @Environment(\.openURL) var openURL
-    
+    @AppStorage("ServerAutostart") private var isServerAutostart: Bool = false
+
     var body: some View {
         VMNavigationListView()
         .overlay(data.showSettingsModal ? AnyView(EmptyView()) : AnyView(BusyOverlay()))
@@ -43,6 +47,9 @@ struct ContentView: View {
         .disabled(data.busy && !data.showNewVMSheet && !data.showSettingsModal)
         .sheet(isPresented: $releaseHelper.isReleaseNotesShown, onDismiss: {
             releaseHelper.closeReleaseNotes()
+            if #available(iOS 17, macOS 14, *) {
+                UTMTipCreateVM.isVMListEmpty = data.virtualMachines.count == 0
+            }
         }, content: {
             VMReleaseNotesView(helper: releaseHelper).padding()
         })
@@ -67,9 +74,18 @@ struct ContentView: View {
         .onAppear {
             Task {
                 await data.listRefresh()
-            }
-            Task {
                 await releaseHelper.fetchReleaseNotes()
+                if #available(iOS 17, macOS 14, *) {
+                    if !releaseHelper.isReleaseNotesShown {
+                        UTMTipCreateVM.isVMListEmpty = data.virtualMachines.count == 0
+                        UTMTipDonate.timesLaunched += 1
+                    }
+                }
+                #if os(macOS)
+                if isServerAutostart {
+                    await data.remoteServer.start()
+                }
+                #endif
             }
             #if os(macOS)
             NSWindow.allowsAutomaticWindowTabbing = false
@@ -78,7 +94,7 @@ struct ContentView: View {
             #if !os(visionOS)
             IQKeyboardManager.shared.enable = true
             #endif
-            #if !WITH_QEMU_TCI
+            #if WITH_JIT
             if !Main.jitAvailable {
                 data.busyWorkAsync {
                     let jitStreamerAttach = UserDefaults.standard.bool(forKey: "JitStreamerAttach")
@@ -95,7 +111,7 @@ struct ContentView: View {
                     #endif
 
                     // ignore error when we are running on a HV only build
-                    if !jb_has_hypervisor() {
+                    if !UTMCapabilities.current.contains(.hasHypervisorSupport) {
                         throw NSLocalizedString("Your version of iOS does not support running VMs while unmodified. You must either run UTM while jailbroken or with a remote debugger attached. See https://getutm.app/install/ for more details.", comment: "ContentView")
                     }
                 }
@@ -103,16 +119,32 @@ struct ContentView: View {
             #endif
             #endif
         }
+        #if WITH_SERVER
+        .onChange(of: isServerAutostart) { newValue in
+            if newValue {
+                Task {
+                    if isServerAutostart && !data.remoteServer.state.isServerActive {
+                        await data.remoteServer.start()
+                    }
+                }
+            }
+        }
+        #endif
     }
     
     private func handleURL(url: URL) {
-        data.busyWorkAsync {
-            if url.isFileURL {
+        if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           components.scheme?.lowercased() == "utm",
+           components.host == "downloadVM",
+           let urlParameter = components.queryItems?.first(where: { $0.name == "url" })?.value,
+           let url = URL(string: urlParameter) {
+            if data.alertItem == nil {
+                data.showNewVMSheet = false
+                data.alertItem = .downloadUrl(url)
+            }
+        } else if url.isFileURL {
+            data.busyWorkAsync {
                 try await importUTM(url: url)
-            } else if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-                      let scheme = components.scheme,
-                      scheme.lowercased() == "utm" {
-                try await handleUTMURL(with: components)
             }
         }
     }
@@ -129,70 +161,6 @@ struct ContentView: View {
             let urls = try result.get()
             for url in urls {
                 try await data.importUTM(from: url)
-            }
-        }
-    }
-    
-    @MainActor private func handleUTMURL(with components: URLComponents) async throws {
-        func findVM() -> VMData? {
-            if let vmName = components.queryItems?.first(where: { $0.name == "name" })?.value {
-                return data.virtualMachines.first(where: { $0.detailsTitleLabel == vmName })
-            } else {
-                return nil
-            }
-        }
-        
-        if let action = components.host {
-            switch action {
-            case "start":
-                if let vm = findVM(), vm.state == .stopped {
-                    data.run(vm: vm)
-                }
-                break
-            case "stop":
-                if let vm = findVM(), vm.state == .started {
-                    try await vm.wrapped!.stop(usingMethod: .force)
-                    data.stop(vm: vm)
-                }
-                break
-            case "restart":
-                if let vm = findVM(), vm.state == .started {
-                    try await vm.wrapped!.restart()
-                }
-                break
-            case "pause":
-                if let vm = findVM(), vm.state == .started {
-                    let shouldSaveOnPause: Bool
-                    if let vm = vm.wrapped as? UTMQemuVirtualMachine {
-                        shouldSaveOnPause = !vm.isRunningAsDisposible
-                    } else {
-                        shouldSaveOnPause = true
-                    }
-                    try await vm.wrapped!.pause()
-                    if shouldSaveOnPause {
-                        try? await vm.wrapped!.saveSnapshot(name: nil)
-                    }
-                }
-            case "resume":
-                if let vm = findVM(), vm.state == .paused {
-                    try await vm.wrapped!.resume()
-                }
-                break
-            case "sendText":
-                if let vm = findVM(), vm.state == .started {
-                    data.automationSendText(to: vm, urlComponents: components)
-                }
-                break
-            case "click":
-                if let vm = findVM(), vm.state == .started {
-                    data.automationSendMouse(to: vm, urlComponents: components)
-                }
-                break
-            case "downloadVM":
-                await data.downloadUTMZip(from: components)
-                break
-            default:
-                return
             }
         }
     }

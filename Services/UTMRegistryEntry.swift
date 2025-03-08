@@ -15,6 +15,7 @@
 //
 
 import Foundation
+import Combine
 
 @objc class UTMRegistryEntry: NSObject, Codable, ObservableObject {
     /// Empty registry entry used only as a workaround for object initialization
@@ -35,7 +36,9 @@ import Foundation
     @Published private var _windowSettings: [Int: Window]
     
     @Published private var _terminalSettings: [Int: Terminal]
-    
+
+    @Published private var _resolutionSettings: [Int: Resolution]
+
     @Published private var _hasMigratedConfig: Bool
     
     @Published private var _macRecoveryIpsw: File?
@@ -49,6 +52,7 @@ import Foundation
         case sharedDirectories = "SharedDirectories"
         case windowSettings = "WindowSettings"
         case terminalSettings = "TerminalSettings"
+        case resolutionSettings = "ResolutionSettings"
         case hasMigratedConfig = "MigratedConfig"
         case macRecoveryIpsw = "MacRecoveryIpsw"
     }
@@ -61,13 +65,14 @@ import Foundation
         } else {
             package = nil
         }
-        _package = package ?? File(path: path)
+        _package = package ?? File(dummyFromPath: path)
         self.uuid = uuid
         _isSuspended = false
         _externalDrives = [:]
         _sharedDirectories = []
         _windowSettings = [:]
         _terminalSettings = [:]
+        _resolutionSettings = [:]
         _hasMigratedConfig = false
     }
     
@@ -88,6 +93,7 @@ import Foundation
         _sharedDirectories = try container.decode([File].self, forKey: .sharedDirectories).filter({ $0.isValid })
         _windowSettings = try container.decode([Int: Window].self, forKey: .windowSettings)
         _terminalSettings = try container.decodeIfPresent([Int: Terminal].self, forKey: .terminalSettings) ?? [:]
+        _resolutionSettings = try container.decodeIfPresent([Int: Resolution].self, forKey: .resolutionSettings) ?? [:]
         _hasMigratedConfig = try container.decodeIfPresent(Bool.self, forKey: .hasMigratedConfig) ?? false
         _macRecoveryIpsw = try container.decodeIfPresent(File.self, forKey: .macRecoveryIpsw)
     }
@@ -102,6 +108,7 @@ import Foundation
         try container.encode(_sharedDirectories, forKey: .sharedDirectories)
         try container.encode(_windowSettings, forKey: .windowSettings)
         try container.encode(_terminalSettings, forKey: .terminalSettings)
+        try container.encode(_resolutionSettings, forKey: .resolutionSettings)
         if _hasMigratedConfig {
             try container.encode(_hasMigratedConfig, forKey: .hasMigratedConfig)
         }
@@ -109,11 +116,7 @@ import Foundation
     }
     
     func asDictionary() throws -> [String: Any] {
-        let encoder = PropertyListEncoder()
-        encoder.outputFormat = .xml
-        let xml = try encoder.encode(self)
-        let dict = try PropertyListSerialization.propertyList(from: xml, format: nil)
-        return dict as! [String: Any]
+        return try propertyList() as! [String: Any]
     }
     
     /// Update the UUID
@@ -128,13 +131,6 @@ import Foundation
 
 protocol UTMRegistryEntryDecodable: Decodable {}
 extension UTMRegistryEntry: UTMRegistryEntryDecodable {}
-extension UTMRegistryEntryDecodable {
-    init(from dictionary: [String: Any]) throws {
-        let data = try PropertyListSerialization.data(fromPropertyList: dictionary, format: .xml, options: 0)
-        let decoder = PropertyListDecoder()
-        self = try decoder.decode(Self.self, from: data)
-    }
-}
 
 // MARK: - Accessors
 @MainActor extension UTMRegistryEntry {
@@ -177,7 +173,11 @@ extension UTMRegistryEntryDecodable {
             _externalDrives = newValue
         }
     }
-    
+
+    var externalDrivePublisher: Published<[String: File]>.Publisher {
+        $_externalDrives
+    }
+
     var sharedDirectories: [File] {
         get {
             _sharedDirectories
@@ -207,7 +207,17 @@ extension UTMRegistryEntryDecodable {
             _terminalSettings = newValue
         }
     }
-    
+
+    var resolutionSettings: [Int: Resolution] {
+        get {
+            _resolutionSettings
+        }
+
+        set {
+            _resolutionSettings = newValue
+        }
+    }
+
     var hasMigratedConfig: Bool {
         get {
             _hasMigratedConfig
@@ -260,6 +270,7 @@ extension UTMRegistryEntryDecodable {
         sharedDirectories = other.sharedDirectories
         windowSettings = other.windowSettings
         terminalSettings = other.terminalSettings
+        resolutionSettings = other.resolutionSettings
         hasMigratedConfig = other.hasMigratedConfig
     }
     
@@ -308,7 +319,7 @@ extension UTMRegistryEntry {
         }
         for drive in viewState.allDrives() {
             if let bookmark = viewState.bookmark(forRemovableDrive: drive), let path = viewState.path(forRemovableDrive: drive) {
-                let file = File(path: path, remoteBookmark: bookmark)
+                let file = File(dummyFromPath: path, remoteBookmark: bookmark)
                 _externalDrives[drive] = file
             }
         }
@@ -393,7 +404,7 @@ extension UTMRegistryEntry {
             self.isValid = true
         }
         
-        fileprivate init(path: String, remoteBookmark: Data = Data()) {
+        init(dummyFromPath path: String, remoteBookmark: Data = Data()) {
             self.path = path
             self.bookmark = Data()
             self.isReadOnly = false
@@ -497,6 +508,31 @@ extension UTMRegistryEntry {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(columns, forKey: .columns)
             try container.encode(rows, forKey: .rows)
+        }
+    }
+
+    struct Resolution: Codable, Equatable {
+        var size: CGSize = .zero
+
+        var isFullscreen: Bool = false
+
+        private enum CodingKeys: String, CodingKey {
+            case size = "Size"
+            case isFullscreen = "Fullscreen"
+        }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            size = try container.decode(CGSize.self, forKey: .size)
+            isFullscreen = try container.decode(Bool.self, forKey: .isFullscreen)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(size, forKey: .size)
+            try container.encode(isFullscreen, forKey: .isFullscreen)
         }
     }
 }

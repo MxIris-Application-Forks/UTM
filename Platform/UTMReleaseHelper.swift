@@ -47,10 +47,10 @@ class UTMReleaseHelper: ObservableObject {
             return
         }
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.allowsCellularAccess = false
+        configuration.allowsCellularAccess = true
         configuration.allowsExpensiveNetworkAccess = false
         configuration.allowsConstrainedNetworkAccess = false
-        configuration.waitsForConnectivity = true
+        configuration.waitsForConnectivity = false
         configuration.httpAdditionalHeaders = ["Accept": "application/vnd.github+json",
                                                "X-GitHub-Api-Version": "2022-11-28"]
         let session = URLSession(configuration: configuration)
@@ -97,6 +97,10 @@ class UTMReleaseHelper: ObservableObject {
                 #if os(iOS) || os(visionOS)
                 #if WITH_QEMU_TCI
                 if platform == "iOS SE" {
+                    currentSection.body.append(description)
+                }
+                #elseif WITH_REMOTE
+                if platform == "iOS Remote" {
                     currentSection.body.append(description)
                 }
                 #endif

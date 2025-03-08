@@ -5,7 +5,7 @@
 "Auto save on background" = "於背景自動儲存";
 
 /* (No Comment) */
-"Auto save on low memory" = "在記憶體不足時自動儲存";
+"Auto save on low memory" = "於記憶體不足時自動儲存";
 
 /* (No Comment) */
 "Background" = "背景";
@@ -26,16 +26,16 @@
 "Cursor" = "指標";
 
 /* (No Comment) */
-"D-DOWN" = "下方向鍵";
+"D-DOWN" = "向下鍵";
 
 /* (No Comment) */
-"D-LEFT" = "左方向鍵";
+"D-LEFT" = "向左鍵";
 
 /* (No Comment) */
-"D-RIGHT" = "右方向鍵";
+"D-RIGHT" = "向右鍵";
 
 /* (No Comment) */
-"D-UP" = "上方向鍵";
+"D-UP" = "向上鍵";
 
 /* (No Comment) */
 "Disabled" = "已禁用";
@@ -104,7 +104,7 @@
 "Right" = "右";
 
 /* (No Comment) */
-"Right Click" = "右鍵單擊";
+"Right Click" = "點按右按鈕";
 
 /* (No Comment) */
 "Space" = "空格";
@@ -145,3 +145,52 @@
 /* (No Comment) */
 "Up" = "上";
 
+// Additional Strings (unable to be extracted by Xcode)
+
+/* (No Comment) */
+"About" = "關於";
+
+/* (No Comment) */
+"Build" = "建立版號";
+
+/* (No Comment) */
+"Cursor - Drag Speed" = "指標 - 拖放速度";
+
+/* (No Comment) */
+"Cursor - Scroll Wheel" = "指標 - 捲動輪";
+
+/* (No Comment) */
+"Default" = "預設值";
+
+/* (No Comment) */
+"Devices" = "裝置";
+
+/* (No Comment) */
+"Disable screen dimming when idle" = "閒置時停用變暗螢幕";
+
+/* (No Comment) */
+"Do not save VM screenshot to disk" = "不要儲存虛擬電腦的螢幕截圖至磁碟";
+
+/* (No Comment) */
+"FPS Limit" = "FPS 限制";
+
+/* (No Comment) */
+"Graphics" = "圖形";
+
+/* (No Comment) */
+"Idle" = "閒置";
+
+/* (No Comment) */
+"Invert Scroll" = "反轉捲動";
+
+/* (No Comment) */
+"License" = "許可";
+
+/* (No Comment) */
+"Prefer device to external microphone" = "偏好外置咪高風裝置";
+
+/* (No Comment) */
+"Renderer Backend" = "渲染器後端";
+
+/* (No Comment) */
+"Version" = "版本";
